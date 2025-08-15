@@ -25,6 +25,11 @@
       <div class="live"><span class="dot"></span> Live blog (simulated)</div>
     </header>
     <main>
+      <div style="margin: 18px 0 24px 0;">
+        <input type="file" id="audioFile" accept="audio/*" />
+        <button id="playBtn" disabled>Play & Stream</button>
+      </div>
+      <audio id="audio" controls style="width:100%; display:none;"></audio>
       <div id="list" class="empty">Waiting for chunks…</div>
     </main>
     <script>
@@ -51,6 +56,79 @@
         list.prepend(done);
       });
       function escapeHtml(s){return s.replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#039;'}[c]))}
+
+      // --- Audio file selection and streaming ---
+      const audioFile = document.getElementById('audioFile');
+      const playBtn = document.getElementById('playBtn');
+      const audio = document.getElementById('audio');
+      let fileBuffer = null;
+      let ws = null;
+
+      audioFile.addEventListener('change', e => {
+        const file = e.target.files[0];
+        if (file) {
+          const url = URL.createObjectURL(file);
+          audio.src = url;
+          audio.style.display = '';
+          playBtn.disabled = false;
+          fileBuffer = file;
+        } else {
+          playBtn.disabled = true;
+          audio.style.display = 'none';
+          fileBuffer = null;
+        }
+      });
+
+      playBtn.addEventListener('click', async () => {
+        if (!fileBuffer) return;
+        playBtn.disabled = true;
+        ws = new WebSocket(`ws://${location.host}/audio-stream`);
+        ws.binaryType = 'arraybuffer';
+        let chunkSize = 32 * 1024; // 32KB
+        let file = fileBuffer;
+        let offset = 0;
+        let lastSentTime = 0;
+        let sending = false;
+
+        function sendNextChunk() {
+          if (!ws || ws.readyState !== 1 || audio.paused) return;
+          // Calculate how much should have been sent based on playback
+          const playedBytes = Math.floor((audio.currentTime / audio.duration) * file.size);
+          while (offset + chunkSize <= playedBytes) {
+            const chunk = file.slice(offset, offset + chunkSize);
+            chunk.arrayBuffer().then(arrayBuffer => {
+              ws.send(arrayBuffer);
+            });
+            offset += chunkSize;
+          }
+        }
+
+        ws.onopen = () => {
+          audio.currentTime = 0;
+          offset = 0;
+          audio.play();
+          sending = true;
+        };
+
+        ws.onclose = () => {
+          playBtn.disabled = false;
+          sending = false;
+        };
+
+        audio.addEventListener('timeupdate', sendNextChunk);
+        audio.addEventListener('pause', () => { sending = false; });
+        audio.addEventListener('ended', () => {
+          // Send any remaining data
+          while (offset < file.size && ws && ws.readyState === 1) {
+            const chunk = file.slice(offset, offset + chunkSize);
+            chunk.arrayBuffer().then(arrayBuffer => {
+              ws.send(arrayBuffer);
+            });
+            offset += chunkSize;
+          }
+          if (ws && ws.readyState === 1) ws.close();
+        });
+      });
     </script>
   </body>
 </html>
