@@ -62,13 +62,24 @@ function bufferToFile(buffer: Buffer, ext = ".wav") {
   return tmpPath;
 }
 
-// --- DEBUG LOGGING for live audio streaming ---
+// --- DEBUG LOGGING for live audio streaming with sentence accumulation ---
 wss.on("connection", ws => {
   let audioBuffers: Buffer[] = [];
   let timer: NodeJS.Timeout | null = null;
   let closed = false;
   let totalBytes = 0;
+  let accumulatedText = "";
+  let avgConfidence: number[] = [];
   console.log("[WS] New audio stream connection");
+
+  // Helper: split text into sentences (returns {complete, incomplete})
+  function splitSentences(text: string): { complete: string[], incomplete: string } {
+    // Regex for sentence boundaries (handles . ! ?)
+    const matches = text.match(/[^.!?\n]+[.!?]+/g) || [];
+    const lastIndex = matches.reduce((idx, s) => idx + s.length, 0);
+    const incomplete = text.slice(lastIndex).trim();
+    return { complete: matches.map(s => s.trim()), incomplete };
+  }
 
   function processBuffer() {
     if (audioBuffers.length === 0) return;
@@ -81,16 +92,49 @@ wss.on("connection", ws => {
     // Segment and transcribe
     segmentFile(tmpFile, 15).then(async ({ files }) => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
+      let allText = "";
+      let confidences: number[] = [];
       for (const path of files) {
         console.log(`[WS] Transcribing chunk: ${path}`);
         const { text, confidence } = await transcribeChunk(path);
         console.log(`[WS] Transcription result:`, { text, confidence });
-        // Summarise
-        const summary = await summariseWindow({ transcriptWindow: text, timeStart: 0, timeEnd: 0 });
+        allText += (allText ? " " : "") + text;
+        confidences.push(confidence);
+      }
+      const avgConf = confidences.length ? confidences.reduce((a, b) => a + b, 0) / confidences.length : 0.8;
+      // Accumulate all text so far
+      accumulatedText += (accumulatedText ? " " : "") + allText;
+      avgConfidence.push(...confidences);
+      // Split into sentences, keep incomplete for next round
+      const { complete, incomplete } = splitSentences(accumulatedText);
+      console.log(`[WS] Current complete sentences:`, JSON.stringify(complete));
+      console.log(`[WS] Current incomplete:`, JSON.stringify(incomplete));
+
+      // Only summarise when enough sentences/words are accumulated
+      let i = 0;
+      while (i < complete.length) {
+        // Group sentences for chunk
+        let chunkSentences: string[] = [];
+        let wordCount = 0;
+        while (i < complete.length && (wordCount < 20 && chunkSentences.length < 2)) {
+          chunkSentences.push(complete[i]);
+          wordCount += complete[i].split(/\s+/).length;
+          i++;
+        }
+        if (chunkSentences.length === 0) break;
+        console.log(`[WS] Buffer state: ${complete.length} sentences, ${wordCount} words`);
+        // Summarise this chunk
+        const groupText = chunkSentences.join(" ").trim();
+        const conf = avgConfidence.length ? avgConfidence.splice(0, chunkSentences.length).reduce((a, b) => a + b, 0) / chunkSentences.length : avgConf;
+        console.log(`[WS] Summarisation input:`, groupText);
+        const summary = await summariseWindow({ transcriptWindow: groupText, timeStart: 0, timeEnd: 0 });
+        summary.confidence = conf;
         console.log(`[WS] Summarisation result:`, summary);
         const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
         broadcast("chunk", chunk);
       }
+      // Keep only the incomplete sentence for next round
+      accumulatedText = incomplete;
       cleanup(tmpFile);
       try { unlinkSync(tmpFile); } catch {}
     });
@@ -99,7 +143,6 @@ wss.on("connection", ws => {
   ws.on("message", (data: Buffer) => {
     audioBuffers.push(Buffer.from(data));
     totalBytes += data.length;
-    console.log(`[WS] Received audio chunk: ${data.length} bytes (total: ${totalBytes})`);
     // Process every ~5 seconds of audio (tune as needed)
     if (!timer) {
       timer = setTimeout(() => {
