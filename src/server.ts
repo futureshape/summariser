@@ -75,6 +75,10 @@ wss.on("connection", ws => {
   let connSampleRate = 16000;
   let connChannels = 1;
   let connName: string | null = null;
+  let clientChunkMs = 250;
+  let summaryWordsPref = 20;
+  let summarySentencesPref = 2;
+  let connSegmentSeconds = 15;
   console.log("[WS] New audio stream connection");
 
   // Helper: split text into sentences (returns {complete, incomplete})
@@ -134,8 +138,8 @@ wss.on("connection", ws => {
       tmpFile = bufferToFile(fullBuffer);
       console.log(`[WS] Wrote temp audio file: ${tmpFile}`);
     }
-    // Segment and transcribe
-    segmentFile(tmpFile, 15).then(async ({ files }) => {
+  // Segment and transcribe
+  segmentFile(tmpFile, connSegmentSeconds).then(async ({ files }) => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
       let allText = "";
       let confidences: number[] = [];
@@ -159,9 +163,9 @@ wss.on("connection", ws => {
       let i = 0;
       while (i < complete.length) {
         // Group sentences for chunk
-        let chunkSentences: string[] = [];
-        let wordCount = 0;
-        while (i < complete.length && (wordCount < 20 && chunkSentences.length < 2)) {
+  let chunkSentences: string[] = [];
+  let wordCount = 0;
+  while (i < complete.length && (wordCount < summaryWordsPref && chunkSentences.length < summarySentencesPref)) {
           chunkSentences.push(complete[i]);
           wordCount += complete[i].split(/\s+/).length;
           i++;
@@ -195,7 +199,11 @@ wss.on("connection", ws => {
           connSampleRate = msg.sampleRate || connSampleRate;
           connChannels = msg.channels || connChannels;
           connName = msg.name || null;
-          console.log('[WS] Handshake received:', { connFormat, connSampleRate, connChannels, connName });
+          clientChunkMs = msg.clientChunkMs || clientChunkMs;
+          summaryWordsPref = msg.summaryWords || summaryWordsPref;
+          summarySentencesPref = msg.summarySentences || summarySentencesPref;
+          connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
+          console.log('[WS] Handshake received:', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
           return;
         }
       } else if (Buffer.isBuffer(data)) {
@@ -209,7 +217,11 @@ wss.on("connection", ws => {
               connSampleRate = msg.sampleRate || connSampleRate;
               connChannels = msg.channels || connChannels;
               connName = msg.name || null;
-              console.log('[WS] Handshake received (buffer):', { connFormat, connSampleRate, connChannels, connName });
+              clientChunkMs = msg.clientChunkMs || clientChunkMs;
+              summaryWordsPref = msg.summaryWords || summaryWordsPref;
+              summarySentencesPref = msg.summarySentences || summarySentencesPref;
+              connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
+              console.log('[WS] Handshake received (buffer):', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
               return;
             }
           } catch {}

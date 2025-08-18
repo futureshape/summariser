@@ -26,8 +26,26 @@
     </header>
     <main>
       <div style="margin: 18px 0 24px 0;">
-        <input type="file" id="audioFile" accept="audio/*" />
-        <button id="playBtn" disabled>Play & Stream</button>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+          <label style="display:flex;gap:8px;align-items:center;">
+            Chunk (ms):
+            <input id="chunkMs" type="number" value="250" min="50" style="width:80px;" />
+          </label>
+          <label style="display:flex;gap:8px;align-items:center;">
+            Summary max words:
+            <input id="summaryWords" type="number" value="20" min="5" style="width:80px;" />
+          </label>
+          <label style="display:flex;gap:8px;align-items:center;">
+            Summary max sentences:
+            <input id="summarySentences" type="number" value="2" min="1" style="width:80px;" />
+          </label>
+          <label style="display:flex;gap:8px;align-items:center;">
+            Segment window (s):
+            <input id="segmentSec" type="number" value="15" min="1" style="width:80px;" />
+          </label>
+          <input type="file" id="audioFile" accept="audio/*" />
+          <button id="playBtn" disabled>Play & Stream</button>
+        </div>
       </div>
       <audio id="audio" controls style="width:100%; display:none;"></audio>
       <div id="list" class="empty">Waiting for chunks…</div>
@@ -61,8 +79,11 @@
       const audioFile = document.getElementById('audioFile');
       const playBtn = document.getElementById('playBtn');
       const audio = document.getElementById('audio');
-      let selectedFile = null;
-      let decodedBuffer = null;
+  let selectedFile = null;
+  let decodedBuffer = null;
+  const chunkMsInput = document.getElementById('chunkMs');
+  const summaryWordsInput = document.getElementById('summaryWords');
+  const summarySentencesInput = document.getElementById('summarySentences');
       let ws = null;
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -106,7 +127,8 @@
         ws.binaryType = 'arraybuffer';
 
         // chunking params
-        const chunkSeconds = 0.25; // 250ms chunks
+  const chunkMs = Number(chunkMsInput?.value || 250);
+  const chunkSeconds = Math.max(0.05, chunkMs / 1000);
         const sr = decodedBuffer.sampleRate;
         const channels = decodedBuffer.numberOfChannels;
         const chunkSamples = Math.floor(chunkSeconds * sr);
@@ -115,8 +137,19 @@
         let intervalId = null;
 
         ws.onopen = () => {
-          // handshake with format info
-          ws.send(JSON.stringify({ kind: 'handshake', format: 's16le', sampleRate: sr, channels, name: selectedFile.name }));
+          // handshake with format info + client-side preferences
+          const segmentSecInput = document.getElementById('segmentSec');
+          ws.send(JSON.stringify({
+            kind: 'handshake',
+            format: 's16le',
+            sampleRate: sr,
+            channels,
+            name: selectedFile.name,
+            clientChunkMs: chunkMs,
+            summaryWords: Number(summaryWordsInput?.value || 20),
+            summarySentences: Number(summarySentencesInput?.value || 2),
+            segmentSeconds: Number(segmentSecInput?.value || 15)
+          }));
           lastSentSample = 0;
           audio.currentTime = 0;
           audio.play();
