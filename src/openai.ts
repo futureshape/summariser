@@ -1,4 +1,3 @@
-
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import { createReadStream } from "node:fs";
@@ -63,9 +62,48 @@ export async function summariseWindow(params: {
     }
   });
 
-  const out = resp.output?.[0]?.content?.[0];
-  if (!out || out.type !== "output_text") throw new Error("Unexpected response shape");
-  const parsed = JSON.parse(out.text) as Omit<LiveBlogChunk, "id">;
+  // Normalize the response output to an object with { type?: string, text: string }
+  type OutputObj = { type?: string; text: string };
+
+  let outObj: OutputObj | undefined;
+  const firstOutput = resp.output?.[0] as any | undefined;
+  if (firstOutput) {
+    // Candidate extraction logic to handle multiple SDK shapes
+    let candidate: any = undefined;
+
+    if ("content" in firstOutput) {
+      // content might be an array or a single item
+      const content = Array.isArray(firstOutput.content) ? firstOutput.content : [firstOutput.content];
+      candidate = content[0];
+    } else if ("output_text" in firstOutput) {
+      candidate = firstOutput.output_text;
+    } else if ("text" in firstOutput) {
+      candidate = firstOutput.text;
+    } else {
+      candidate = firstOutput;
+    }
+
+    // Candidate can be:
+    // - a simple string (the output text)
+    // - an object like { type: 'output_text', text: '...' }
+    // - a nested object with content array containing the above
+    if (typeof candidate === "string") {
+      outObj = { type: "output_text", text: candidate };
+    } else if (candidate && typeof candidate === "object") {
+      if ("text" in candidate && typeof candidate.text === "string") {
+        outObj = { type: candidate.type ?? "output_text", text: candidate.text };
+      } else if ("content" in candidate) {
+        const inner = Array.isArray(candidate.content) ? candidate.content[0] : candidate.content;
+        if (typeof inner === "string") outObj = { type: "output_text", text: inner };
+        else if (inner && typeof inner === "object" && "text" in inner) outObj = { type: inner.type ?? "output_text", text: inner.text };
+      }
+    }
+  }
+
+  if (!outObj) throw new Error("Unexpected response shape: no textual output found");
+  if (outObj.type !== "output_text") throw new Error("Unexpected response shape: output not of type 'output_text'");
+
+  const parsed = JSON.parse(outObj.text) as Omit<LiveBlogChunk, "id">;
   // Ensure the model uses the time window we passed
   return { ...parsed, time_start: timeStart, time_end: timeEnd };
 }
