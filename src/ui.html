@@ -78,7 +78,7 @@
         const el = document.createElement('article');
         el.className = 'card';
         el.innerHTML = `
-          <div class="meta">${fmt(c.time_start)}–${fmt(c.time_end)} • conf ${(c.confidence*100).toFixed(0)}%</div>
+          <div class="meta">${fmt(c.time_start)}–${fmt(c.time_end)}</div>
           <h3>${escapeHtml(c.headline)}</h3>
           <ul>${c.bullets.map(b=>`<li>${escapeHtml(b)}</li>`).join('')}</ul>
           ${c.quotes?.length? `<div class="small"><strong>Quotes:</strong> ${c.quotes.map(q=>`“${escapeHtml(q)}”`).join(' · ')}</div>`:''}

@@ -70,7 +70,7 @@ wss.on("connection", ws => {
   let closed = false;
   let totalBytes = 0;
   let accumulatedText = "";
-  let avgConfidence: number[] = [];
+  // confidence tracking removed
   let connFormat: string | null = null;
   let connSampleRate = 16000;
   let connChannels = 1;
@@ -143,22 +143,18 @@ wss.on("connection", ws => {
   // Segment and transcribe
   segmentFile(tmpFile, connSegmentSeconds).then(async ({ files }) => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
-      let allText = "";
-      let confidences: number[] = [];
+  let allText = "";
       for (let idx = 0; idx < files.length; idx++) {
         const path = files[idx];
         console.log(`[WS] Transcribing chunk: ${path}`);
-        const { text, confidence } = await transcribeChunk(path);
-        console.log(`[WS] Transcription result:`, { text, confidence });
-        // broadcast each transcript piece as it's produced
-        broadcast('transcript_piece', { index: idx, path, text, confidence });
-        allText += (allText ? " " : "") + text;
-        confidences.push(confidence);
+  const { text } = await transcribeChunk(path);
+  console.log(`[WS] Transcription result:`, { text });
+  // broadcast each transcript piece as it's produced
+  broadcast('transcript_piece', { index: idx, path, text });
+  allText += (allText ? " " : "") + text;
       }
-      const avgConf = confidences.length ? confidences.reduce((a, b) => a + b, 0) / confidences.length : 0.8;
   // Accumulate all text so far
   accumulatedText += (accumulatedText ? " " : "") + allText;
-  avgConfidence.push(...confidences);
   // broadcast rolling buffer preview for UI
   try { broadcast('rolling_buffer', { buffer: accumulatedText }); } catch (e) {}
       // Split into sentences, keep incomplete for next round
@@ -181,7 +177,6 @@ wss.on("connection", ws => {
             entities: s.entities || [],
             time_start: 0,
             time_end: 0,
-            confidence: typeof s.confidence === 'number' ? s.confidence : avgConf,
             revision_of: null
           };
           const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
@@ -278,7 +273,7 @@ if (argv.file) {
     console.log(`Segmented into ${files.length} chunks of ~${argv.chunk}s`);
 
     const windowBackSeconds = Math.max(30, argv.chunk * 2); // rolling context
-    const transcriptHistory: { start: number; end: number; text: string; conf: number }[] = [];
+    const transcriptHistory: { start: number; end: number; text: string }[] = [];
 
     let clock = 0; // simulated seconds position
 
@@ -291,8 +286,8 @@ if (argv.file) {
       const waitMs = Math.max(0, (argv.chunk * 1000) / argv.speed);
       await new Promise(r => setTimeout(r, waitMs));
 
-      const { text, confidence } = await transcribeChunk(path);
-      transcriptHistory.push({ start, end, text, conf: confidence });
+      const { text } = await transcribeChunk(path);
+      transcriptHistory.push({ start, end, text });
 
       // Hold-back before we summarise this window
       await new Promise(r => setTimeout(r, argv.hold * 1000));

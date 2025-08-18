@@ -11,21 +11,17 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL || "gpt-4o-transcribe"; // fallback to whisper-1 if needed
 const SUMMARISE_MODEL = process.env.SUMMARISE_MODEL || "gpt-4o-mini";
 
+
 export async function transcribeChunk(path: string) {
   const resp = await client.audio.transcriptions.create({
     file: createReadStream(path) as any,
     model: TRANSCRIBE_MODEL
   });
-  // resp.text only; confidence not exposed → we proxy confidence via heuristic
-  return { text: resp.text as string, confidence: heuristicConfidence(resp.text as string) };
+  // Only return the transcript text; confidence is not provided by the API.
+  return { text: resp.text as string };
 }
 
-function heuristicConfidence(text: string): number {
-  // Very rough: longer, more punctuated text ⇒ higher confidence
-  const len = text.trim().split(/\s+/).length;
-  const punc = (text.match(/[\.,;:!?]/g) || []).length;
-  return Math.max(0.4, Math.min(0.98, 0.45 + len/200 + punc/50));
-}
+
 
 export async function summariseWindow(params: {
   transcriptWindow: string;
@@ -119,7 +115,7 @@ export async function incrementalSummarise(params: { text: string }) {
     "- Only summarize complete sentences or complete thoughts that end in sentence punctuation (. ? !) or an obvious sentence boundary (newline plus capital). Do not attempt to summarize an incomplete trailing fragment.",
     "- The \"remaining\" field must be exactly the trailing substring of the original transcript that is incomplete and unsummarised. It must be a literal suffix of the input text. If there is no trailing incomplete fragment, set \"remaining\" to an empty string \"\".",
     "- Do NOT include any earlier or already-summarised content inside \"remaining\". Do NOT echo the start of the input inside \"remaining\".",
-    "- When producing summaries, prefer short verb-led bullets and a short headline per summary item. Use confidence as a number 0–1.",
+  "- When producing summaries, prefer short verb-led bullets and a short headline per summary item.",
     "- Output only valid JSON exactly matching the schema; do not add prose, explanation, or extra keys."
   ].join(" ");
 
@@ -139,11 +135,10 @@ export async function incrementalSummarise(params: { text: string }) {
               headline: { type: "string" },
               bullets: { type: "array", items: { type: "string" } },
               quotes: { type: "array", items: { type: "string" } },
-              entities: { type: "array", items: { type: "string" } },
-              confidence: { type: "number", minimum: 0, maximum: 1 }
+              entities: { type: "array", items: { type: "string" } }
             },
             // validator requires 'required' to include every property when additionalProperties is false
-            required: ["headline", "bullets", "quotes", "entities", "confidence"]
+            required: ["headline", "bullets", "quotes", "entities"]
           }
         },
         remaining: { type: "string" }
@@ -160,8 +155,8 @@ export async function incrementalSummarise(params: { text: string }) {
   // Provide two concrete examples to make the required behaviour explicit.
   const exampleAOut = {
     summaries: [
-      { headline: "Project funded", bullets: ["Team will fund the project"], quotes: [], entities: [], confidence: 0.9 },
-      { headline: "Timeline", bullets: ["Expect six-month timeline, start in June"], quotes: [], entities: [], confidence: 0.85 }
+      { headline: "Project funded", bullets: ["Team will fund the project"], quotes: [], entities: [] },
+      { headline: "Timeline", bullets: ["Expect six-month timeline, start in June"], quotes: [], entities: [] }
     ],
     remaining: "Budget details are still..."
   };
