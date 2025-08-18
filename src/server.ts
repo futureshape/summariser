@@ -2,7 +2,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { segmentFile, cleanup } from "./segmenter.js";
-import { transcribeChunk, summariseWindow } from "./openai.js";
+import { transcribeChunk, summariseWindow, incrementalSummarise } from "./openai.js";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { randomUUID } from "node:crypto";
@@ -79,6 +79,8 @@ wss.on("connection", ws => {
   let summaryWordsPref = 20;
   let summarySentencesPref = 2;
   let connSegmentSeconds = 15;
+  // How often (ms) we collect audio and run segmentation/transcription
+  let processIntervalMs = 10000; // default to 10s
   console.log("[WS] New audio stream connection");
 
   // Helper: split text into sentences (returns {complete, incomplete})
@@ -143,47 +145,57 @@ wss.on("connection", ws => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
       let allText = "";
       let confidences: number[] = [];
-      for (const path of files) {
+      for (let idx = 0; idx < files.length; idx++) {
+        const path = files[idx];
         console.log(`[WS] Transcribing chunk: ${path}`);
         const { text, confidence } = await transcribeChunk(path);
         console.log(`[WS] Transcription result:`, { text, confidence });
+        // broadcast each transcript piece as it's produced
+        broadcast('transcript_piece', { index: idx, path, text, confidence });
         allText += (allText ? " " : "") + text;
         confidences.push(confidence);
       }
       const avgConf = confidences.length ? confidences.reduce((a, b) => a + b, 0) / confidences.length : 0.8;
-      // Accumulate all text so far
-      accumulatedText += (accumulatedText ? " " : "") + allText;
-      avgConfidence.push(...confidences);
+  // Accumulate all text so far
+  accumulatedText += (accumulatedText ? " " : "") + allText;
+  avgConfidence.push(...confidences);
+  // broadcast rolling buffer preview for UI
+  try { broadcast('rolling_buffer', { buffer: accumulatedText }); } catch (e) {}
       // Split into sentences, keep incomplete for next round
       const { complete, incomplete } = splitSentences(accumulatedText);
       console.log(`[WS] Current complete sentences:`, JSON.stringify(complete));
       console.log(`[WS] Current incomplete:`, JSON.stringify(incomplete));
 
-      // Only summarise when enough sentences/words are accumulated
-      let i = 0;
-      while (i < complete.length) {
-        // Group sentences for chunk
-  let chunkSentences: string[] = [];
-  let wordCount = 0;
-  while (i < complete.length && (wordCount < summaryWordsPref && chunkSentences.length < summarySentencesPref)) {
-          chunkSentences.push(complete[i]);
-          wordCount += complete[i].split(/\s+/).length;
-          i++;
+      // Use incremental summariser: let the LLM decide which complete items to summarise
+      try {
+        // Log what we're about to send (preview)
+        try { console.log('[WS] Calling incrementalSummarise; accumulatedText length=', accumulatedText.length, 'preview=', accumulatedText.replace(/\s+/g,' ').slice(0,200)); } catch {}
+        const { summaries, remaining } = await incrementalSummarise({ text: accumulatedText });
+        console.log('[WS] Incremental summariser returned', { count: summaries.length, remainingLength: remaining?.length });
+        for (const s of summaries) {
+          // Map incremental summary shape to LiveBlogChunk-like object
+          const summary: Omit<LiveBlogChunk, 'id'> = {
+            headline: s.headline || (s.bullets && s.bullets[0]) || 'Summary',
+            bullets: s.bullets || [],
+            quotes: s.quotes || [],
+            entities: s.entities || [],
+            time_start: 0,
+            time_end: 0,
+            confidence: typeof s.confidence === 'number' ? s.confidence : avgConf,
+            revision_of: null
+          };
+          const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
+          broadcast('chunk', chunk);
         }
-        if (chunkSentences.length === 0) break;
-        console.log(`[WS] Buffer state: ${complete.length} sentences, ${wordCount} words`);
-        // Summarise this chunk
-        const groupText = chunkSentences.join(" ").trim();
-        const conf = avgConfidence.length ? avgConfidence.splice(0, chunkSentences.length).reduce((a, b) => a + b, 0) / chunkSentences.length : avgConf;
-        console.log(`[WS] Summarisation input:`, groupText);
-        const summary = await summariseWindow({ transcriptWindow: groupText, timeStart: 0, timeEnd: 0 });
-        summary.confidence = conf;
-        console.log(`[WS] Summarisation result:`, summary);
-        const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
-        broadcast("chunk", chunk);
+  // Keep unsummarised trailing text for next round
+  accumulatedText = remaining || incomplete;
+  try { console.log('[WS] Post-incremental remaining preview=', (accumulatedText||'').replace(/\s+/g,' ').slice(0,200)); } catch {}
+  try { broadcast('rolling_buffer', { buffer: accumulatedText }); } catch (e) {}
+      } catch (e) {
+        console.error('[WS] incremental summariser error:', e);
+        // fallback to previous behaviour: keep incomplete tail
+        accumulatedText = incomplete;
       }
-      // Keep only the incomplete sentence for next round
-      accumulatedText = incomplete;
   cleanup(tmpFile);
   try { unlinkSync(tmpFile); } catch {}
     });
@@ -203,6 +215,7 @@ wss.on("connection", ws => {
           summaryWordsPref = msg.summaryWords || summaryWordsPref;
           summarySentencesPref = msg.summarySentences || summarySentencesPref;
           connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
+          processIntervalMs = msg.processIntervalMs || processIntervalMs;
           console.log('[WS] Handshake received:', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
           return;
         }
@@ -221,6 +234,7 @@ wss.on("connection", ws => {
               summaryWordsPref = msg.summaryWords || summaryWordsPref;
               summarySentencesPref = msg.summarySentences || summarySentencesPref;
               connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
+              processIntervalMs = msg.processIntervalMs || processIntervalMs;
               console.log('[WS] Handshake received (buffer):', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
               return;
             }
@@ -245,7 +259,7 @@ wss.on("connection", ws => {
       timer = setTimeout(() => {
         processBuffer();
         timer = null;
-      }, 5000);
+      }, processIntervalMs);
     }
   });
 

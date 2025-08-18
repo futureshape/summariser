@@ -107,3 +107,140 @@ export async function summariseWindow(params: {
   // Ensure the model uses the time window we passed
   return { ...parsed, time_start: timeStart, time_end: timeEnd };
 }
+
+// Incremental summarisation: summarise as many complete thoughts as possible
+// and return the remaining trailing unsummarised text.
+export async function incrementalSummarise(params: { text: string }) {
+  const { text } = params;
+
+  const sys = [
+    "You receive a live transcript (may end with an incomplete trailing fragment). Produce a JSON object matching the schema: { summaries: [...], remaining: \"\" } and nothing else.",
+    "Rules:",
+    "- Only summarize complete sentences or complete thoughts that end in sentence punctuation (. ? !) or an obvious sentence boundary (newline plus capital). Do not attempt to summarize an incomplete trailing fragment.",
+    "- The \"remaining\" field must be exactly the trailing substring of the original transcript that is incomplete and unsummarised. It must be a literal suffix of the input text. If there is no trailing incomplete fragment, set \"remaining\" to an empty string \"\".",
+    "- Do NOT include any earlier or already-summarised content inside \"remaining\". Do NOT echo the start of the input inside \"remaining\".",
+    "- When producing summaries, prefer short verb-led bullets and a short headline per summary item. Use confidence as a number 0–1.",
+    "- Output only valid JSON exactly matching the schema; do not add prose, explanation, or extra keys."
+  ].join(" ");
+
+  // Schema for the incremental response
+  const incrementalSchema = {
+    name: "Incremental",
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        summaries: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              headline: { type: "string" },
+              bullets: { type: "array", items: { type: "string" } },
+              quotes: { type: "array", items: { type: "string" } },
+              entities: { type: "array", items: { type: "string" } },
+              confidence: { type: "number", minimum: 0, maximum: 1 }
+            },
+            // validator requires 'required' to include every property when additionalProperties is false
+            required: ["headline", "bullets", "quotes", "entities", "confidence"]
+          }
+        },
+        remaining: { type: "string" }
+      },
+      required: ["summaries", "remaining"]
+    }
+  } as const;
+
+  const contextBits = [
+    process.env.CONTEXT_TITLE ? `Talk title: ${process.env.CONTEXT_TITLE}` : "",
+    process.env.CONTEXT_SPEAKER ? `Speaker: ${process.env.CONTEXT_SPEAKER}` : "",
+  ].filter(Boolean).join("\n");
+
+  // Provide two concrete examples to make the required behaviour explicit.
+  const exampleAOut = {
+    summaries: [
+      { headline: "Project funded", bullets: ["Team will fund the project"], quotes: [], entities: [], confidence: 0.9 },
+      { headline: "Timeline", bullets: ["Expect six-month timeline, start in June"], quotes: [], entities: [], confidence: 0.85 }
+    ],
+    remaining: "Budget details are still..."
+  };
+  const exampleBOut = { summaries: [], remaining: "Budget details are still being reviewed and we might need" };
+
+  const examplesText = [
+    "Examples:",
+    "Input A:",
+    "We will fund the project. The timeline is six months and we expect to start in June. Budget details are still...",
+    "Expected Output A:",
+    JSON.stringify(exampleAOut),
+    "",
+    "Input B:",
+    "Budget details are still being reviewed and we might need",
+    "Expected Output B:",
+    JSON.stringify(exampleBOut)
+  ].join("\n");
+
+  const resp = await client.responses.create({
+    model: SUMMARISE_MODEL,
+    input: [
+      { role: "system", content: sys },
+      { role: "user", content: [
+        { type: "input_text", text: contextBits || "" },
+        { type: "input_text", text: examplesText },
+        { type: "input_text", text: `Transcript (may contain incomplete trailing fragment):\n${text}` }
+      ] }
+    ],
+    text: {
+      format: { name: "json_schema", type: "json_schema", schema: incrementalSchema.schema }
+    }
+  });
+
+  // Log what we sent to the LLM (truncated) for debugging
+  try {
+    const preview = (text || '').replace(/\s+/g, ' ').slice(0, 1000);
+    console.log('[LLM DEBUG] incrementalSummarise input length=', (text || '').length, 'preview=', preview);
+  } catch {}
+
+  const firstOutput = resp.output?.[0] as any | undefined;
+  if (!firstOutput) throw new Error("No response from summariser");
+
+  // extract candidate similar to summariseWindow
+  let candidate: any = undefined;
+  if ("content" in firstOutput) {
+    const content = Array.isArray(firstOutput.content) ? firstOutput.content : [firstOutput.content];
+    candidate = content[0];
+  } else if ("output_text" in firstOutput) {
+    candidate = firstOutput.output_text;
+  } else if ("text" in firstOutput) {
+    candidate = firstOutput.text;
+  } else {
+    candidate = firstOutput;
+  }
+
+  let outText = typeof candidate === 'string' ? candidate : (candidate && candidate.text ? candidate.text : undefined);
+  if (!outText) {
+    // try stringify whole firstOutput
+    outText = JSON.stringify(firstOutput);
+  }
+
+  // Log raw output (truncated) before parsing
+  try {
+    const rawPreview = (outText as string).replace(/\s+/g, ' ').slice(0, 1500);
+    console.log('[LLM DEBUG] incrementalSummarise raw output preview=', rawPreview);
+  } catch {}
+
+  // parse JSON output
+  let parsed: any;
+  try {
+    parsed = JSON.parse(outText as string);
+  } catch (e) {
+    throw new Error(`Failed to parse incremental summariser output as JSON: ${e}`);
+  }
+
+  // Expect { summaries: [...], remaining: '...' }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.summaries) || typeof parsed.remaining !== 'string') {
+    throw new Error('Unexpected incremental summariser shape');
+  }
+
+  return { summaries: parsed.summaries as any[], remaining: parsed.remaining as string };
+}
