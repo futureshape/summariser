@@ -57,77 +57,129 @@
       });
       function escapeHtml(s){return s.replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#039;'}[c]))}
 
-      // --- Audio file selection and streaming ---
+      // --- Audio file selection and streaming (send raw decoded PCM s16le) ---
       const audioFile = document.getElementById('audioFile');
       const playBtn = document.getElementById('playBtn');
       const audio = document.getElementById('audio');
-      let fileBuffer = null;
+      let selectedFile = null;
+      let decodedBuffer = null;
       let ws = null;
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-      audioFile.addEventListener('change', e => {
+      // helper: convert Float32Array (interleaved) to Int16 PCM (s16le)
+      function floatTo16BitPCM(float32Array) {
+        const l = float32Array.length;
+        const buffer = new ArrayBuffer(l * 2);
+        const view = new DataView(buffer);
+        let offset = 0;
+        for (let i = 0; i < l; i++, offset += 2) {
+          let s = Math.max(-1, Math.min(1, float32Array[i]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        return buffer;
+      }
+
+      audioFile.addEventListener('change', async e => {
         const file = e.target.files[0];
         if (file) {
+          selectedFile = file;
+          // decode into AudioBuffer for raw PCM extraction
+          const ab = await file.arrayBuffer();
+          decodedBuffer = await audioCtx.decodeAudioData(ab.slice(0));
           const url = URL.createObjectURL(file);
           audio.src = url;
           audio.style.display = '';
           playBtn.disabled = false;
-          fileBuffer = file;
         } else {
           playBtn.disabled = true;
           audio.style.display = 'none';
-          fileBuffer = null;
+          selectedFile = null;
+          decodedBuffer = null;
         }
       });
 
       playBtn.addEventListener('click', async () => {
-        if (!fileBuffer) return;
+        if (!decodedBuffer || !selectedFile) return;
         playBtn.disabled = true;
         const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
         ws = new WebSocket(`${wsProtocol}://${location.host}/audio-stream`);
         ws.binaryType = 'arraybuffer';
-        let chunkSize = 32 * 1024; // 32KB
-        let file = fileBuffer;
-        let offset = 0;
-        let lastSentTime = 0;
-        let sending = false;
 
-        function sendNextChunk() {
-          if (!ws || ws.readyState !== 1 || audio.paused) return;
-          // Calculate how much should have been sent based on playback
-          const playedBytes = Math.floor((audio.currentTime / audio.duration) * file.size);
-          while (offset + chunkSize <= playedBytes) {
-            const chunk = file.slice(offset, offset + chunkSize);
-            chunk.arrayBuffer().then(arrayBuffer => {
-              ws.send(arrayBuffer);
-            });
-            offset += chunkSize;
-          }
-        }
+        // chunking params
+        const chunkSeconds = 0.25; // 250ms chunks
+        const sr = decodedBuffer.sampleRate;
+        const channels = decodedBuffer.numberOfChannels;
+        const chunkSamples = Math.floor(chunkSeconds * sr);
+
+        let lastSentSample = 0;
+        let intervalId = null;
 
         ws.onopen = () => {
+          // handshake with format info
+          ws.send(JSON.stringify({ kind: 'handshake', format: 's16le', sampleRate: sr, channels, name: selectedFile.name }));
+          lastSentSample = 0;
           audio.currentTime = 0;
-          offset = 0;
           audio.play();
-          sending = true;
+
+          // send loop (interval ensures ordered sends)
+          intervalId = setInterval(() => {
+            if (!ws || ws.readyState !== 1 || audio.paused) return;
+            const currentSample = Math.floor(audio.currentTime * sr);
+            if (currentSample <= lastSentSample) return;
+            const end = Math.min(currentSample, decodedBuffer.length);
+            // build interleaved Float32
+            const frames = end - lastSentSample;
+            let interleaved = null;
+            if (channels === 1) {
+              interleaved = decodedBuffer.getChannelData(0).subarray(lastSentSample, end);
+            } else {
+              interleaved = new Float32Array(frames * channels);
+              let idx = 0;
+              for (let i = lastSentSample; i < end; i++) {
+                for (let ch = 0; ch < channels; ch++) {
+                  interleaved[idx++] = decodedBuffer.getChannelData(ch)[i];
+                }
+              }
+            }
+            // convert and send
+            const pcm16 = floatTo16BitPCM(interleaved);
+            try { ws.send(pcm16); } catch (e) { console.error('ws send failed', e); }
+            lastSentSample = end;
+          }, Math.max(50, chunkSeconds * 1000));
         };
 
         ws.onclose = () => {
           playBtn.disabled = false;
-          sending = false;
+          if (intervalId) clearInterval(intervalId);
         };
 
-        audio.addEventListener('timeupdate', sendNextChunk);
-        audio.addEventListener('pause', () => { sending = false; });
+        audio.addEventListener('pause', () => {
+          if (intervalId) clearInterval(intervalId);
+        });
+
         audio.addEventListener('ended', () => {
-          // Send any remaining data
-          while (offset < file.size && ws && ws.readyState === 1) {
-            const chunk = file.slice(offset, offset + chunkSize);
-            chunk.arrayBuffer().then(arrayBuffer => {
-              ws.send(arrayBuffer);
-            });
-            offset += chunkSize;
+          // send remaining samples
+          if (lastSentSample < decodedBuffer.length && ws && ws.readyState === 1) {
+            const end = decodedBuffer.length;
+            const frames = end - lastSentSample;
+            let interleaved = null;
+            if (channels === 1) {
+              interleaved = decodedBuffer.getChannelData(0).subarray(lastSentSample, end);
+            } else {
+              interleaved = new Float32Array(frames * channels);
+              let idx = 0;
+              for (let i = lastSentSample; i < end; i++) {
+                for (let ch = 0; ch < channels; ch++) {
+                  interleaved[idx++] = decodedBuffer.getChannelData(ch)[i];
+                }
+              }
+            }
+            const pcm16 = floatTo16BitPCM(interleaved);
+            try { ws.send(pcm16); } catch (e) { console.error('ws send failed', e); }
           }
           if (ws && ws.readyState === 1) ws.close();
+          playBtn.disabled = false;
+          if (intervalId) clearInterval(intervalId);
         });
       });
     </script>

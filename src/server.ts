@@ -65,11 +65,16 @@ function bufferToFile(buffer: Buffer, ext = ".wav") {
 // --- DEBUG LOGGING for live audio streaming with sentence accumulation ---
 wss.on("connection", ws => {
   let audioBuffers: Buffer[] = [];
+  let pcmBuffers: Buffer[] = [];
   let timer: NodeJS.Timeout | null = null;
   let closed = false;
   let totalBytes = 0;
   let accumulatedText = "";
   let avgConfidence: number[] = [];
+  let connFormat: string | null = null;
+  let connSampleRate = 16000;
+  let connChannels = 1;
+  let connName: string | null = null;
   console.log("[WS] New audio stream connection");
 
   // Helper: split text into sentences (returns {complete, incomplete})
@@ -82,13 +87,53 @@ wss.on("connection", ws => {
   }
 
   function processBuffer() {
-    if (audioBuffers.length === 0) return;
-    const fullBuffer = Buffer.concat(audioBuffers);
-    audioBuffers = [];
-    console.log(`[WS] Processing buffer: ${fullBuffer.length} bytes`);
-    // Save to temp file
-    const tmpFile = bufferToFile(fullBuffer);
-    console.log(`[WS] Wrote temp audio file: ${tmpFile}`);
+    if (audioBuffers.length === 0 && pcmBuffers.length === 0) return;
+    // prefer pcmBuffers if handshake indicated raw PCM
+    let fullBuffer: Buffer;
+    let tmpFile: string;
+    if (pcmBuffers.length > 0 || connFormat === 's16le') {
+      fullBuffer = Buffer.concat(pcmBuffers);
+      pcmBuffers = [];
+      console.log(`[WS] Processing PCM buffer: ${fullBuffer.length} bytes (format=${connFormat})`);
+      // write WAV header + PCM data so ffmpeg can read it
+      tmpFile = bufferToFile(fullBuffer, '.wav');
+      try {
+        // overwrite the file with proper WAV header + data
+        const bytesPerSample = 2; // s16le
+        const blockAlign = connChannels * bytesPerSample;
+        const byteRate = connSampleRate * blockAlign;
+        const dataSize = fullBuffer.length;
+        const header = Buffer.alloc(44);
+        header.write('RIFF', 0);
+        header.writeUInt32LE(36 + dataSize, 4);
+        header.write('WAVE', 8);
+        header.write('fmt ', 12);
+        header.writeUInt32LE(16, 16); // PCM chunk size
+        header.writeUInt16LE(1, 20); // audio format = PCM
+        header.writeUInt16LE(connChannels, 22);
+        header.writeUInt32LE(connSampleRate, 24);
+        header.writeUInt32LE(byteRate, 28);
+        header.writeUInt16LE(blockAlign, 32);
+        header.writeUInt16LE(bytesPerSample * 8, 34);
+        header.write('data', 36);
+        header.writeUInt32LE(dataSize, 40);
+        // write header + pcm
+        const combined = Buffer.concat([header, fullBuffer]);
+        writeFileSync(tmpFile, combined);
+      } catch (e) {
+        console.error('[WS] Failed to write WAV file:', e);
+        // fall back to raw write
+        writeFileSync(tmpFile, fullBuffer);
+      }
+      console.log(`[WS] Wrote temp audio file (wav): ${tmpFile}`);
+    } else {
+      fullBuffer = Buffer.concat(audioBuffers);
+      audioBuffers = [];
+      console.log(`[WS] Processing buffer: ${fullBuffer.length} bytes`);
+      // Save to temp file
+      tmpFile = bufferToFile(fullBuffer);
+      console.log(`[WS] Wrote temp audio file: ${tmpFile}`);
+    }
     // Segment and transcribe
     segmentFile(tmpFile, 15).then(async ({ files }) => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
@@ -135,14 +180,54 @@ wss.on("connection", ws => {
       }
       // Keep only the incomplete sentence for next round
       accumulatedText = incomplete;
-      cleanup(tmpFile);
-      try { unlinkSync(tmpFile); } catch {}
+  cleanup(tmpFile);
+  try { unlinkSync(tmpFile); } catch {}
     });
   }
 
-  ws.on("message", (data: Buffer) => {
-    audioBuffers.push(Buffer.from(data));
-    totalBytes += data.length;
+  ws.on("message", (data: Buffer | string) => {
+    // Handle handshake JSON first (string or JSON buffer)
+    try {
+      if (typeof data === 'string') {
+        const msg = JSON.parse(data);
+        if (msg && msg.kind === 'handshake') {
+          connFormat = msg.format || null;
+          connSampleRate = msg.sampleRate || connSampleRate;
+          connChannels = msg.channels || connChannels;
+          connName = msg.name || null;
+          console.log('[WS] Handshake received:', { connFormat, connSampleRate, connChannels, connName });
+          return;
+        }
+      } else if (Buffer.isBuffer(data)) {
+        // Check if this is a JSON handshake encoded as buffer
+        const s = data.toString('utf8');
+        if (s.startsWith('{') && s.indexOf('format') !== -1) {
+          try {
+            const msg = JSON.parse(s);
+            if (msg && msg.kind === 'handshake') {
+              connFormat = msg.format || null;
+              connSampleRate = msg.sampleRate || connSampleRate;
+              connChannels = msg.channels || connChannels;
+              connName = msg.name || null;
+              console.log('[WS] Handshake received (buffer):', { connFormat, connSampleRate, connChannels, connName });
+              return;
+            }
+          } catch {}
+        }
+      }
+
+      // Otherwise treat as binary audio payload
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+      if (connFormat === 's16le') {
+        pcmBuffers.push(buf);
+      } else {
+        audioBuffers.push(buf);
+      }
+      totalBytes += buf.length;
+    } catch (e) {
+      console.error('[WS] Error parsing message:', e);
+      return;
+    }
     // Process every ~5 seconds of audio (tune as needed)
     if (!timer) {
       timer = setTimeout(() => {
