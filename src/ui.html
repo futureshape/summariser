@@ -82,7 +82,8 @@
       playBtn.addEventListener('click', async () => {
         if (!fileBuffer) return;
         playBtn.disabled = true;
-        ws = new WebSocket(`ws://${location.host}/audio-stream`);
+        const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(`${wsProtocol}://${location.host}/audio-stream`);
         ws.binaryType = 'arraybuffer';
         let chunkSize = 32 * 1024; // 32KB
         let file = fileBuffer;
