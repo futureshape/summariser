@@ -2,7 +2,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { segmentFile, cleanup } from "./segmenter.js";
-import { transcribeChunk, summariseWindow, incrementalSummarise } from "./openai.js";
+import { transcribeChunk, summariseWindow, timerBasedSummarise } from "./openai.js";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { randomUUID } from "node:crypto";
@@ -38,7 +38,7 @@ app.get("/stream", (req, res) => {
   });
   const id = randomUUID();
   clients.add({ id, res });
-  req.on("close", () => { clients.forEach(c => c.id===id && clients.delete(c)); });
+  req.on("close", () => { clients.forEach(c => c.id === id && clients.delete(c)); });
 });
 
 function broadcast(event: string, data: any) {
@@ -46,8 +46,7 @@ function broadcast(event: string, data: any) {
   for (const c of clients) c.res.write(payload);
 }
 
-
-http.listen(5173, () => console.log("UI: http://localhost:5173"));
+http.listen(5173, () => console.log("[WS] UI: http://localhost:5173"));
 
 // --- WebSocket for live audio streaming ---
 const wss = new WebSocketServer({ server: http, path: "/audio-stream" });
@@ -62,35 +61,79 @@ function bufferToFile(buffer: Buffer, ext = ".wav") {
   return tmpPath;
 }
 
-// --- DEBUG LOGGING for live audio streaming with sentence accumulation ---
+// --- Timer-based summarization approach ---
 wss.on("connection", ws => {
   let audioBuffers: Buffer[] = [];
   let pcmBuffers: Buffer[] = [];
   let timer: NodeJS.Timeout | null = null;
+  let summaryTimer: NodeJS.Timeout | null = null;
   let closed = false;
   let totalBytes = 0;
-  let accumulatedText = "";
-  // confidence tracking removed
+  let completeTranscript = ""; // Full transcript
+  let previousSummary = ""; // Last summary output (for next timer call)
+
+  // Configuration
   let connFormat: string | null = null;
   let connSampleRate = 16000;
   let connChannels = 1;
   let connName: string | null = null;
   let clientChunkMs = 250;
-  let summaryWordsPref = 20;
-  let summarySentencesPref = 2;
+  let summaryWordsPref = 40; // Default to 40 words for timer-based approach
   let connSegmentSeconds = 15;
-  // How often (ms) we collect audio and run segmentation/transcription
-  let processIntervalMs = 10000; // default to 10s
+  let processIntervalMs = 10000; // default to 10s for audio processing
+  let summaryIntervalMs = 10000; // default to 10s for summary calls (configurable)
+
   console.log("[WS] New audio stream connection");
 
-  // Helper: split text into sentences (returns {complete, incomplete})
-  function splitSentences(text: string): { complete: string[], incomplete: string } {
-    // Regex for sentence boundaries (handles . ! ?)
-    const matches = text.match(/[^.!?\n]+[.!?]+/g) || [];
-    const lastIndex = matches.reduce((idx, s) => idx + s.length, 0);
-    const incomplete = text.slice(lastIndex).trim();
-    return { complete: matches.map(s => s.trim()), incomplete };
+  // Start the summary timer
+  function startSummaryTimer() {
+    if (summaryTimer) clearInterval(summaryTimer);
+    summaryTimer = setInterval(async () => {
+      if (closed) return;
+
+      // Get last N words from complete transcript
+      const words = completeTranscript.trim().split(/\s+/).filter(w => w.length > 0);
+      const lastWords = words.slice(-summaryWordsPref).join(' ');
+
+      if (lastWords.length === 0) {
+        console.log('[SUMMARISER] No words to summarize yet');
+        return;
+      }
+
+      try {
+        // Minimal debug: show only the transcript excerpt used and the previous summary
+        console.log('[SUMMARISER] INPUT', JSON.stringify({ lastWords, previousSummary }, null, 2));
+
+        const summary = await timerBasedSummarise({
+          lastWords,
+          previousSummary,
+          maxWords: summaryWordsPref
+        });
+
+        // Only create a chunk if there's meaningful content
+        if (summary.headline && summary.headline.trim()) {
+          const chunk: LiveBlogChunk = {
+            id: randomUUID(),
+            headline: summary.headline,
+            bullets: summary.bullets || [],
+            quotes: summary.quotes || [],
+            entities: summary.entities || [],
+            revision_of: null
+          };
+          broadcast('chunk', chunk);
+
+          // Update previous summary for next call
+          previousSummary = `Headline: ${summary.headline}\nBullets: ${summary.bullets.join('; ')}`;
+          console.log(`[SUMMARISER] Generated summary: "${summary.headline}"`);
+        } else {
+          console.log('[SUMMARISER] No new content to summarize');
+        }
+      } catch (e) {
+        console.error('[SUMMARISER] Summary error:', e);
+      }
+    }, summaryIntervalMs);
   }
+
 
   function processBuffer() {
     if (audioBuffers.length === 0 && pcmBuffers.length === 0) return;
@@ -140,59 +183,29 @@ wss.on("connection", ws => {
       tmpFile = bufferToFile(fullBuffer);
       console.log(`[WS] Wrote temp audio file: ${tmpFile}`);
     }
-  // Segment and transcribe
-  segmentFile(tmpFile, connSegmentSeconds).then(async ({ files }) => {
+
+    // Segment and transcribe
+    segmentFile(tmpFile, connSegmentSeconds).then(async ({ files }) => {
       console.log(`[WS] Segmented into ${files.length} chunks`);
-  let allText = "";
+      let allText = "";
       for (let idx = 0; idx < files.length; idx++) {
         const path = files[idx];
-        console.log(`[WS] Transcribing chunk: ${path}`);
-  const { text } = await transcribeChunk(path);
-  console.log(`[WS] Transcription result:`, { text });
-  // broadcast each transcript piece as it's produced
-  broadcast('transcript_piece', { index: idx, path, text });
-  allText += (allText ? " " : "") + text;
+        console.log(`[TRANSCRIPT] Transcribing chunk: ${path}`);
+        const { text } = await transcribeChunk(path);
+        console.log(`[TRANSCRIPT] Transcription result:`, { text });
+        // broadcast each transcript piece as it's produced
+        broadcast('transcript_piece', { index: idx, path, text });
+        allText += (allText ? " " : "") + text;
       }
-  // Accumulate all text so far
-  accumulatedText += (accumulatedText ? " " : "") + allText;
-  // broadcast rolling buffer preview for UI
-  try { broadcast('rolling_buffer', { buffer: accumulatedText }); } catch (e) {}
-      // Split into sentences, keep incomplete for next round
-      const { complete, incomplete } = splitSentences(accumulatedText);
-      console.log(`[WS] Current complete sentences:`, JSON.stringify(complete));
-      console.log(`[WS] Current incomplete:`, JSON.stringify(incomplete));
 
-      // Use incremental summariser: let the LLM decide which complete items to summarise
-      try {
-        // Log what we're about to send (preview)
-        try { console.log('[WS] Calling incrementalSummarise; accumulatedText length=', accumulatedText.length, 'preview=', accumulatedText.replace(/\s+/g,' ').slice(0,200)); } catch {}
-        const { summaries, remaining } = await incrementalSummarise({ text: accumulatedText });
-        console.log('[WS] Incremental summariser returned', { count: summaries.length, remainingLength: remaining?.length });
-        for (const s of summaries) {
-          // Map incremental summary shape to LiveBlogChunk-like object
-          const summary: Omit<LiveBlogChunk, 'id'> = {
-            headline: s.headline || (s.bullets && s.bullets[0]) || 'Summary',
-            bullets: s.bullets || [],
-            quotes: s.quotes || [],
-            entities: s.entities || [],
-            time_start: 0,
-            time_end: 0,
-            revision_of: null
-          };
-          const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
-          broadcast('chunk', chunk);
-        }
-  // Keep unsummarised trailing text for next round
-  accumulatedText = remaining || incomplete;
-  try { console.log('[WS] Post-incremental remaining preview=', (accumulatedText||'').replace(/\s+/g,' ').slice(0,200)); } catch {}
-  try { broadcast('rolling_buffer', { buffer: accumulatedText }); } catch (e) {}
-      } catch (e) {
-        console.error('[WS] incremental summariser error:', e);
-        // fallback to previous behaviour: keep incomplete tail
-        accumulatedText = incomplete;
+      if (allText.trim()) {
+        // Append new transcription text to the running transcript
+        completeTranscript += (completeTranscript ? " " : "") + allText.trim();
+        console.log(`[TRANSCRIPT] Appended transcription to completeTranscript (len=${allText.length})`);
       }
-  cleanup(tmpFile);
-  try { unlinkSync(tmpFile); } catch {}
+
+      cleanup(tmpFile);
+      try { unlinkSync(tmpFile); } catch { }
     });
   }
 
@@ -208,10 +221,20 @@ wss.on("connection", ws => {
           connName = msg.name || null;
           clientChunkMs = msg.clientChunkMs || clientChunkMs;
           summaryWordsPref = msg.summaryWords || summaryWordsPref;
-          summarySentencesPref = msg.summarySentences || summarySentencesPref;
           connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
           processIntervalMs = msg.processIntervalMs || processIntervalMs;
-          console.log('[WS] Handshake received:', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
+
+          // New: summary interval configuration
+          summaryIntervalMs = msg.summaryIntervalMs || summaryIntervalMs;
+
+          console.log('[WS] Handshake received:', {
+            connFormat, connSampleRate, connChannels, connName,
+            clientChunkMs, summaryWordsPref,
+            connSegmentSeconds, processIntervalMs, summaryIntervalMs
+          });
+
+          // Start the summary timer after handshake
+          startSummaryTimer();
           return;
         }
       } else if (Buffer.isBuffer(data)) {
@@ -227,13 +250,20 @@ wss.on("connection", ws => {
               connName = msg.name || null;
               clientChunkMs = msg.clientChunkMs || clientChunkMs;
               summaryWordsPref = msg.summaryWords || summaryWordsPref;
-              summarySentencesPref = msg.summarySentences || summarySentencesPref;
               connSegmentSeconds = msg.segmentSeconds || connSegmentSeconds;
               processIntervalMs = msg.processIntervalMs || processIntervalMs;
-              console.log('[WS] Handshake received (buffer):', { connFormat, connSampleRate, connChannels, connName, clientChunkMs, summaryWordsPref, summarySentencesPref, connSegmentSeconds });
+              summaryIntervalMs = msg.summaryIntervalMs || summaryIntervalMs;
+
+              console.log('[WS] Handshake received (buffer):', {
+                connFormat, connSampleRate, connChannels, connName,
+                clientChunkMs, summaryWordsPref,
+                connSegmentSeconds, processIntervalMs, summaryIntervalMs
+              });
+
+              startSummaryTimer();
               return;
             }
-          } catch {}
+          } catch { }
         }
       }
 
@@ -261,7 +291,8 @@ wss.on("connection", ws => {
   ws.on("close", () => {
     closed = true;
     if (timer) clearTimeout(timer);
-    console.log(`[WS] Connection closed. Processing remaining buffer (${audioBuffers.reduce((a,b)=>a+b.length,0)} bytes)`);
+    if (summaryTimer) clearInterval(summaryTimer);
+    console.log(`[WS] Connection closed. Processing remaining buffer (${audioBuffers.reduce((a, b) => a + b.length, 0)} bytes)`);
     processBuffer();
   });
 });
@@ -270,7 +301,7 @@ wss.on("connection", ws => {
 if (argv.file) {
   (async () => {
     const { dir, files } = await segmentFile(argv.file as string, argv.chunk);
-    console.log(`Segmented into ${files.length} chunks of ~${argv.chunk}s`);
+    console.log(`[TRANSCRIPT] Segmented into ${files.length} chunks of ~${argv.chunk}s`);
 
     const windowBackSeconds = Math.max(30, argv.chunk * 2); // rolling context
     const transcriptHistory: { start: number; end: number; text: string }[] = [];
@@ -299,13 +330,16 @@ if (argv.file) {
         .map(s => s.text)
         .join("\n");
 
+      // Minimal debug: show only the transcript window text that will be summarised
+      console.log('[LLM INPUT - summariseWindow]', JSON.stringify({ windowText }, null, 2));
+
       const summary = await summariseWindow({
         transcriptWindow: windowText,
         timeStart: start,
         timeEnd: end
       });
 
-      const chunk: LiveBlogChunk = { id: randomUUID(), ...summary };
+      const chunk: LiveBlogChunk = { id: randomUUID(), ...summary, revision_of: null };
       broadcast("chunk", chunk);
 
       clock = end;

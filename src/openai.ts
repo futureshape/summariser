@@ -100,50 +100,44 @@ export async function summariseWindow(params: {
   if (outObj.type !== "output_text") throw new Error("Unexpected response shape: output not of type 'output_text'");
 
   const parsed = JSON.parse(outObj.text) as Omit<LiveBlogChunk, "id">;
-  // Ensure the model uses the time window we passed
-  return { ...parsed, time_start: timeStart, time_end: timeEnd };
+  // Return parsed summary (no time fields in new shape)
+  return parsed;
 }
 
-// Incremental summarisation: summarise as many complete thoughts as possible
-// and return the remaining trailing unsummarised text.
-export async function incrementalSummarise(params: { text: string }) {
-  const { text } = params;
+// New approach: timer-based summarization with last N words + previous summary
+export async function timerBasedSummarise(params: { 
+  lastWords: string; 
+  previousSummary: string;
+  maxWords?: number;
+}) {
+  const { lastWords, previousSummary, maxWords = 40 } = params;
 
   const sys = [
-    "You receive a live transcript (may end with an incomplete trailing fragment). Produce a JSON object matching the schema: { summaries: [...], remaining: \"\" } and nothing else.",
+    "You are a live summarizer. You receive:",
+    "1. The last few words from a live transcript",
+    "2. The output from the previous summarization call (may be empty)",
+    "",
     "Rules:",
-    "- Only summarize complete sentences or complete thoughts that end in sentence punctuation (. ? !) or an obvious sentence boundary (newline plus capital). Do not attempt to summarize an incomplete trailing fragment.",
-    "- The \"remaining\" field must be exactly the trailing substring of the original transcript that is incomplete and unsummarised. It must be a literal suffix of the input text. If there is no trailing incomplete fragment, set \"remaining\" to an empty string \"\".",
-    "- Do NOT include any earlier or already-summarised content inside \"remaining\". Do NOT echo the start of the input inside \"remaining\".",
-  "- When producing summaries, prefer short verb-led bullets and a short headline per summary item.",
-    "- Output only valid JSON exactly matching the schema; do not add prose, explanation, or extra keys."
+    "- Only output NEW information that the speaker said, don't repeat what was already summarized adequately in the previous summary",
+    "- If there is nothing new or significant to add, return an empty summary (empty headline, empty bullets, etc.)",
+    "- When there is new content, be concise and focus on key points",
+    "- Use short, clear bullets and headlines",
+    "- Output valid JSON matching the schema"
   ].join(" ");
 
-  // Schema for the incremental response
-  const incrementalSchema = {
-    name: "Incremental",
+  // Schema for the timer-based response
+  const timerSchema = {
+    name: "TimerSummary",
     schema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        summaries: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              headline: { type: "string" },
-              bullets: { type: "array", items: { type: "string" } },
-              quotes: { type: "array", items: { type: "string" } },
-              entities: { type: "array", items: { type: "string" } }
-            },
-            // validator requires 'required' to include every property when additionalProperties is false
-            required: ["headline", "bullets", "quotes", "entities"]
-          }
-        },
-        remaining: { type: "string" }
+        headline: { type: "string" },
+        bullets: { type: "array", items: { type: "string" } },
+        quotes: { type: "array", items: { type: "string" } },
+        entities: { type: "array", items: { type: "string" } }
       },
-      required: ["summaries", "remaining"]
+      required: ["headline", "bullets", "quotes", "entities"]
     }
   } as const;
 
@@ -152,54 +146,31 @@ export async function incrementalSummarise(params: { text: string }) {
     process.env.CONTEXT_SPEAKER ? `Speaker: ${process.env.CONTEXT_SPEAKER}` : "",
   ].filter(Boolean).join("\n");
 
-  // Provide two concrete examples to make the required behaviour explicit.
-  const exampleAOut = {
-    summaries: [
-      { headline: "Project funded", bullets: ["Team will fund the project"], quotes: [], entities: [] },
-      { headline: "Timeline", bullets: ["Expect six-month timeline, start in June"], quotes: [], entities: [] }
-    ],
-    remaining: "Budget details are still..."
-  };
-  const exampleBOut = { summaries: [], remaining: "Budget details are still being reviewed and we might need" };
-
-  const examplesText = [
-    "Examples:",
-    "Input A:",
-    "We will fund the project. The timeline is six months and we expect to start in June. Budget details are still...",
-    "Expected Output A:",
-    JSON.stringify(exampleAOut),
-    "",
-    "Input B:",
-    "Budget details are still being reviewed and we might need",
-    "Expected Output B:",
-    JSON.stringify(exampleBOut)
-  ].join("\n");
-
   const resp = await client.responses.create({
     model: SUMMARISE_MODEL,
     input: [
       { role: "system", content: sys },
       { role: "user", content: [
         { type: "input_text", text: contextBits || "" },
-        { type: "input_text", text: examplesText },
-        { type: "input_text", text: `Transcript (may contain incomplete trailing fragment):\n${text}` }
+        { type: "input_text", text: `Previous summary:\n${previousSummary || "(none - this is the first call)"}` },
+        { type: "input_text", text: `Last ${maxWords} words from transcript:\n${lastWords}` }
       ] }
     ],
     text: {
-      format: { name: "json_schema", type: "json_schema", schema: incrementalSchema.schema }
+      format: { name: "json_schema", type: "json_schema", schema: timerSchema.schema }
     }
   });
 
   // Log what we sent to the LLM (truncated) for debugging
   try {
-    const preview = (text || '').replace(/\s+/g, ' ').slice(0, 1000);
-    console.log('[LLM DEBUG] incrementalSummarise input length=', (text || '').length, 'preview=', preview);
+    console.log('[LLM DEBUG] timerBasedSummarise lastWords length=', lastWords.length, 'previousSummary length=', previousSummary.length);
+    console.log('[LLM DEBUG] lastWords preview=', lastWords.replace(/\s+/g, ' ').slice(0, 200));
   } catch {}
 
   const firstOutput = resp.output?.[0] as any | undefined;
-  if (!firstOutput) throw new Error("No response from summariser");
+  if (!firstOutput) throw new Error("No response from timer summariser");
 
-  // extract candidate similar to summariseWindow
+  // extract candidate similar to other functions
   let candidate: any = undefined;
   if ("content" in firstOutput) {
     const content = Array.isArray(firstOutput.content) ? firstOutput.content : [firstOutput.content];
@@ -214,14 +185,13 @@ export async function incrementalSummarise(params: { text: string }) {
 
   let outText = typeof candidate === 'string' ? candidate : (candidate && candidate.text ? candidate.text : undefined);
   if (!outText) {
-    // try stringify whole firstOutput
     outText = JSON.stringify(firstOutput);
   }
 
   // Log raw output (truncated) before parsing
   try {
-    const rawPreview = (outText as string).replace(/\s+/g, ' ').slice(0, 1500);
-    console.log('[LLM DEBUG] incrementalSummarise raw output preview=', rawPreview);
+    const rawPreview = (outText as string).replace(/\s+/g, ' ').slice(0, 1000);
+    console.log('[LLM DEBUG] timerBasedSummarise raw output preview=', rawPreview);
   } catch {}
 
   // parse JSON output
@@ -229,13 +199,29 @@ export async function incrementalSummarise(params: { text: string }) {
   try {
     parsed = JSON.parse(outText as string);
   } catch (e) {
-    throw new Error(`Failed to parse incremental summariser output as JSON: ${e}`);
+    throw new Error(`Failed to parse timer summariser output as JSON: ${e}`);
   }
 
-  // Expect { summaries: [...], remaining: '...' }
-  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.summaries) || typeof parsed.remaining !== 'string') {
-    throw new Error('Unexpected incremental summariser shape');
+  // Expect { headline, bullets, quotes, entities }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Unexpected timer summariser shape');
   }
 
-  return { summaries: parsed.summaries as any[], remaining: parsed.remaining as string };
+  return {
+    headline: parsed.headline || "",
+    bullets: parsed.bullets || [],
+    quotes: parsed.quotes || [],
+    entities: parsed.entities || []
+  };
+}
+
+// Keep the old function for backward compatibility during transition
+export async function incrementalSummarise(params: { text: string }) {
+  // This is the old implementation - keeping for now
+  return timerBasedSummarise({ 
+    lastWords: params.text.split(' ').slice(-40).join(' '), 
+    previousSummary: "" 
+  }).then(result => ({
+  summaries: result.headline ? [result] : []
+  }));
 }

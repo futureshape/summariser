@@ -35,11 +35,7 @@
           </label>
           <label style="display:flex;gap:8px;align-items:center;">
             Summary max words:
-            <input id="summaryWords" type="number" value="20" min="5" style="width:80px;" />
-          </label>
-          <label style="display:flex;gap:8px;align-items:center;">
-            Summary max sentences:
-            <input id="summarySentences" type="number" value="2" min="1" style="width:80px;" />
+            <input id="summaryWords" type="number" value="40" min="5" style="width:80px;" />
           </label>
           <label style="display:flex;gap:8px;align-items:center;">
             Segment window (s):
@@ -59,26 +55,24 @@
       <div style="width:380px;">
         <div class="card">
           <h3>Live transcript</h3>
-          <div id="transcript" style="max-height:320px;overflow:auto;font-size:13px;color:#ddd;white-space:pre-wrap;">No transcript yet</div>
-        </div>
-        <div class="card">
-          <h3>Rolling summariser buffer</h3>
-          <div id="rolling" style="max-height:220px;overflow:auto;font-size:13px;color:#ddd;white-space:pre-wrap;">Buffer empty</div>
+          <div id="transcript" style="max-height:540px;overflow:auto;font-size:13px;color:#ddd;white-space:pre-wrap;">No transcript yet</div>
         </div>
       </div>
     </main>
     <script>
   const list = document.getElementById('list');
   const transcriptEl = document.getElementById('transcript');
-  const rollingEl = document.getElementById('rolling');
-      const fmt = s => new Date(s*1000).toISOString().substring(14,19);
+      const timeNow = () => {
+        const d = new Date();
+        return d.toTimeString().slice(0,5); // HH:MM
+      };
       const es = new EventSource('/stream');
       const add = c => {
         if (list.classList.contains('empty')) list.classList.remove('empty'), list.innerHTML='';
         const el = document.createElement('article');
         el.className = 'card';
         el.innerHTML = `
-          <div class="meta">${fmt(c.time_start)}–${fmt(c.time_end)}</div>
+          <div class="meta">${timeNow()}</div>
           <h3>${escapeHtml(c.headline)}</h3>
           <ul>${c.bullets.map(b=>`<li>${escapeHtml(b)}</li>`).join('')}</ul>
           ${c.quotes?.length? `<div class="small"><strong>Quotes:</strong> ${c.quotes.map(q=>`“${escapeHtml(q)}”`).join(' · ')}</div>`:''}
@@ -94,12 +88,6 @@
             transcriptEl.scrollTop = transcriptEl.scrollHeight;
           }
         } catch (e) { console.error('transcript_piece parse', e); }
-      });
-      es.addEventListener('rolling_buffer', ev => {
-        try {
-          const b = JSON.parse(ev.data);
-          if (rollingEl) rollingEl.textContent = b.buffer || '';
-        } catch (e) { console.error('rolling_buffer parse', e); }
       });
       es.addEventListener('eof', () => {
         const done = document.createElement('div');
@@ -117,7 +105,6 @@
   let decodedBuffer = null;
   const chunkMsInput = document.getElementById('chunkMs');
   const summaryWordsInput = document.getElementById('summaryWords');
-  const summarySentencesInput = document.getElementById('summarySentences');
       let ws = null;
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -181,8 +168,8 @@
             channels,
             name: selectedFile.name,
             clientChunkMs: chunkMs,
-            summaryWords: Number(summaryWordsInput?.value || 20),
-            summarySentences: Number(summarySentencesInput?.value || 2),
+            summaryWords: Number(summaryWordsInput?.value || 40),
+            // summarySentences removed - not used in timer-based summariser
             segmentSeconds: Number(segmentSecInput?.value || 15),
             processIntervalMs: Number(processMsInput?.value || 10000)
           }));
@@ -227,7 +214,6 @@
         });
 
         audio.addEventListener('ended', () => {
-          // send remaining samples
           if (lastSentSample < decodedBuffer.length && ws && ws.readyState === 1) {
             const end = decodedBuffer.length;
             const frames = end - lastSentSample;
