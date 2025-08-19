@@ -1,3 +1,6 @@
+⚠️ TODO: update this README, it's no longer accurate after the last few iterations
+
+--------
 A minimal end‑to‑end blueprint that **simulates a live conference** using **local audio files**. It transcribes short chunks, turns them into **live‑blog cards**, and streams them to a tiny web UI.
 
 - **No live ingest required** – point it at an MP3/WAV and it plays the file back “as if live”.
